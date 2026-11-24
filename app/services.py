@@ -1,13 +1,19 @@
-"""Core service logic: mask submission / correction and gap queries.
+"""Core service logic: mask submission / correction, gap queries and
+two-period coverage comparison.
 
 Design guarantees (see README for the full rationale):
 
 * A submission runs inside one transaction. On any failure nothing is
   committed, so operators can still query the previous committed result.
 * Re-submitting a band only reads *that scene's* source masks and only
-  rewrites coverage rows inside *that scene's* grid extent.
-* Queries never read per-scene masks: they read the committed ``coverage``
+  rewrites coverage rows inside *that scene's* grid extent. Cross-period
+  statistics are updated only for cells where this scene flips the cell
+  between computable and not computable on the submitted date.
+* Gap queries never read per-scene masks: they read the committed ``coverage``
   table only, at most one row per rectangle cell.
+* Comparison queries read only the committed per-cell cumulative checkpoints,
+  never masks or per-day coverage, and their row reads are bounded by the
+  rectangle's cell count -- not by the date span or ingested days.
 """
 
 from __future__ import annotations
@@ -22,6 +28,8 @@ from .models import (
     GAP_DIFFERENT_SCENES,
     GAP_NIR_ONLY,
     GAP_RED_ONLY,
+    DecreasedCell,
+    DecreasedRun,
     GapRun,
     MaskSubmission,
 )
@@ -29,6 +37,69 @@ from .models import (
 
 class GeometryConflictError(Exception):
     """A re-submitted scene uses a different origin or size."""
+
+
+def _prefix_total(
+    conn: sqlite3.Connection, x: int, y: int, before: str
+) -> int:
+    """Computable days for one cell from the beginning of record up to ``before``.
+
+    ``cell_cumulative`` is sparse (one row per computable day), so this is a
+    single descending index probe -- it never scans the date range.
+    """
+    row = conn.execute(
+        "SELECT total FROM cell_cumulative "
+        "WHERE x = ? AND y = ? AND date < ? ORDER BY date DESC LIMIT 1",
+        (x, y, before),
+    ).fetchone()
+    return int(row["total"]) if row is not None else 0
+
+
+def _flip_cumulative(
+    conn: sqlite3.Connection, x: int, y: int, date_str: str, is_computable: bool
+) -> None:
+    """Add/remove one computable day for a cell and shift later checkpoints.
+
+    Called only when a submission changes this cell on this date between
+    computable and not computable. Only statistics rows for the same cell are
+    read or written; coverage of other dates is never read. The cumulative
+    totals after this date change by exactly +/-1, so later checkpoints are
+    shifted rather than recomputed.
+    """
+    if is_computable:
+        total = _prefix_total(conn, x, y, date_str) + 1
+        conn.execute(
+            "INSERT OR IGNORE INTO cell_registry (x, y) VALUES (?, ?)", (x, y)
+        )
+        conn.execute(
+            "INSERT INTO cell_cumulative (x, y, date, total) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (x, y, date) DO UPDATE SET total = excluded.total",
+            (x, y, date_str, total),
+        )
+        conn.execute(
+            "UPDATE cell_cumulative SET total = total + 1 "
+            "WHERE x = ? AND y = ? AND date > ?",
+            (x, y, date_str),
+        )
+    else:
+        cur = conn.execute(
+            "DELETE FROM cell_cumulative WHERE x = ? AND y = ? AND date = ?",
+            (x, y, date_str),
+        )
+        if cur.rowcount:
+            conn.execute(
+                "UPDATE cell_cumulative SET total = total - 1 "
+                "WHERE x = ? AND y = ? AND date > ?",
+                (x, y, date_str),
+            )
+        left = conn.execute(
+            "SELECT 1 FROM cell_cumulative WHERE x = ? AND y = ? LIMIT 1",
+            (x, y),
+        ).fetchone()
+        if left is None:
+            conn.execute(
+                "DELETE FROM cell_registry WHERE x = ? AND y = ?", (x, y)
+            )
 
 
 def _flatten(mask: list[list[int]]) -> bytes:
@@ -110,6 +181,7 @@ def submit_mask(conn: sqlite3.Connection, sub: MaskSubmission) -> dict:
     }
 
     touched = 0
+    flips = 0
     for iy in range(h):
         for ix in range(w):
             idx = iy * w + ix
@@ -121,6 +193,7 @@ def submit_mask(conn: sqlite3.Connection, sub: MaskSubmission) -> dict:
             nir_scenes = (
                 set(json.loads(row["nir_scenes"])) if row is not None else set()
             )
+            was_computable = bool(red_scenes & nir_scenes)
 
             # Drop this scene's previous contribution, then apply the new one.
             red_scenes.discard(sub.scene_id)
@@ -142,25 +215,31 @@ def submit_mask(conn: sqlite3.Connection, sub: MaskSubmission) -> dict:
                     "DELETE FROM coverage WHERE date = ? AND x = ? AND y = ?",
                     (date_str, x, y),
                 )
-                touched += 1
-                continue
-
-            conn.execute(
-                "INSERT INTO coverage (date, x, y, red_scenes, nir_scenes) "
-                "VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT (date, x, y) DO UPDATE SET "
-                "red_scenes = excluded.red_scenes, "
-                "nir_scenes = excluded.nir_scenes, "
-                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-                (
-                    date_str,
-                    x,
-                    y,
-                    json.dumps(sorted(red_scenes), separators=(",", ":")),
-                    json.dumps(sorted(nir_scenes), separators=(",", ":")),
-                ),
-            )
+            else:
+                conn.execute(
+                    "INSERT INTO coverage (date, x, y, red_scenes, nir_scenes) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT (date, x, y) DO UPDATE SET "
+                    "red_scenes = excluded.red_scenes, "
+                    "nir_scenes = excluded.nir_scenes, "
+                    "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                    (
+                        date_str,
+                        x,
+                        y,
+                        json.dumps(sorted(red_scenes), separators=(",", ":")),
+                        json.dumps(sorted(nir_scenes), separators=(",", ":")),
+                    ),
+                )
             touched += 1
+
+            # Cross-period statistics are touched only where this scene flips
+            # the cell between computable and not computable. No coverage of
+            # any other date is read (or written) here.
+            is_computable = bool(red_scenes & nir_scenes)
+            if is_computable != was_computable:
+                _flip_cumulative(conn, x, y, date_str, is_computable)
+                flips += 1
 
     return {
         "date": sub.date,
@@ -172,6 +251,7 @@ def submit_mask(conn: sqlite3.Connection, sub: MaskSubmission) -> dict:
         "height": h,
         "valid_cells": valid_cells,
         "coverage_cells_updated": touched,
+        "cumulative_cells_updated": flips,
     }
 
 
@@ -275,6 +355,142 @@ def query_gaps(
         "gap_cells": gap_total,
         "category_counts": category_counts,
         "gaps": gaps,
+    }
+
+
+def compare_coverage(
+    conn: sqlite3.Connection,
+    origin_x: int,
+    origin_y: int,
+    width: int,
+    height: int,
+    period_a_start: date_type,
+    period_a_end: date_type,
+    period_b_start: date_type,
+    period_b_end: date_type,
+) -> dict:
+    """Compare per-cell computable-day coverage between two inclusive periods.
+
+    Reads only ``cell_registry`` and ``cell_cumulative``: at most one registry
+    row per rectangle cell, and four index probes per cell (the last checkpoint
+    at/before each period end, and the last one strictly before each period
+    start). The work is bounded by ``width * height`` and does not grow with
+    the date span or with the number of ingested days. Masks and per-day
+    ``coverage`` rows are never read here.
+
+    The periods may overlap or have different lengths; the ratio of
+    computable days to inclusive calendar days is what is compared.
+    """
+    a_start_s = period_a_start.isoformat()
+    a_end_s = period_a_end.isoformat()
+    b_start_s = period_b_start.isoformat()
+    b_end_s = period_b_end.isoformat()
+    a_days = (period_a_end - period_a_start).days + 1
+    b_days = (period_b_end - period_b_start).days + 1
+
+    def _counts_range(start: str, end: str) -> dict[tuple[int, int], int]:
+        """Computable-day counts per cell in ``[start, end]``.
+
+        One statement per grid row (at most ``height`` of them), each seeking
+        ``cell_registry`` by ``(y, x)`` so exactly the rectangle's cells are
+        visited; every cell then costs two descending probes on
+        ``cell_cumulative``. The date span is never scanned.
+        """
+        out: dict[tuple[int, int], int] = {}
+        sql = (
+            "SELECT r.x AS x, "
+            "  (SELECT c.total FROM cell_cumulative c "
+            "   WHERE c.x = r.x AND c.y = r.y AND c.date <= ? "
+            "   ORDER BY c.date DESC LIMIT 1) AS upto_end, "
+            "  (SELECT c.total FROM cell_cumulative c "
+            "   WHERE c.x = r.x AND c.y = r.y AND c.date < ? "
+            "   ORDER BY c.date DESC LIMIT 1) AS upto_before "
+            "FROM cell_registry r "
+            "WHERE r.y = ? AND r.x BETWEEN ? AND ?"
+        )
+        for y in range(origin_y, origin_y + height):
+            rows = conn.execute(
+                sql, (end, start, y, origin_x, origin_x + width - 1)
+            ).fetchall()
+            for r in rows:
+                count = (r["upto_end"] or 0) - (r["upto_before"] or 0)
+                if count:
+                    out[(r["x"], y)] = count
+        return out
+
+    a_counts = _counts_range(a_start_s, a_end_s)
+    b_counts = _counts_range(b_start_s, b_end_s)
+
+    days_a_rows: list[list[int]] = []
+    days_b_rows: list[list[int]] = []
+    decreased: list[DecreasedCell] = []
+    decreased_runs: list[DecreasedRun] = []
+
+    for iy in range(height):
+        y = origin_y + iy
+        row_a: list[int] = []
+        row_b: list[int] = []
+        run_start: int | None = None
+        for ix in range(width):
+            x = origin_x + ix
+            days_a = a_counts.get((x, y), 0)
+            days_b = b_counts.get((x, y), 0)
+            row_a.append(days_a)
+            row_b.append(days_b)
+            # Integers compare exactly: days_a/a_days > days_b/b_days.
+            if days_a * b_days > days_b * a_days:
+                decreased.append(
+                    DecreasedCell(
+                        x=x,
+                        y=y,
+                        computable_days_a=days_a,
+                        computable_days_b=days_b,
+                        ratio_a=round(days_a / a_days, 6),
+                        ratio_b=round(days_b / b_days, 6),
+                    )
+                )
+                if run_start is None:
+                    run_start = x
+            elif run_start is not None:
+                decreased_runs.append(
+                    DecreasedRun(
+                        y=y, x_start=run_start, x_end=x - 1, length=x - run_start
+                    )
+                )
+                run_start = None
+        if run_start is not None:
+            decreased_runs.append(
+                DecreasedRun(
+                    y=y,
+                    x_start=run_start,
+                    x_end=origin_x + width - 1,
+                    length=origin_x + width - run_start,
+                )
+            )
+        days_a_rows.append(row_a)
+        days_b_rows.append(row_b)
+
+    return {
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "width": width,
+        "height": height,
+        "period_a": {
+            "start": period_a_start,
+            "end": period_a_end,
+            "calendar_days": a_days,
+        },
+        "period_b": {
+            "start": period_b_start,
+            "end": period_b_end,
+            "calendar_days": b_days,
+        },
+        "total_cells": width * height,
+        "computable_days_a": days_a_rows,
+        "computable_days_b": days_b_rows,
+        "decreased_count": len(decreased),
+        "decreased_cells": decreased,
+        "decreased_runs": decreased_runs,
     }
 
 

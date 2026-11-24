@@ -11,14 +11,21 @@ from typing import Annotated
 from fastapi import FastAPI, HTTPException, Query, status
 
 from .config import MAX_SIDE
-from .db import connect, init_db, session
+from .db import init_db, session, snapshot
 from .models import (
+    CoverageCompareResponse,
     GapQueryResponse,
     MaskSubmitResponse,
     MaskSubmission,
     SceneInfo,
 )
-from .services import GeometryConflictError, get_scene, query_gaps, submit_mask
+from .services import (
+    GeometryConflictError,
+    compare_coverage,
+    get_scene,
+    query_gaps,
+    submit_mask,
+)
 
 
 @asynccontextmanager
@@ -91,13 +98,73 @@ def gaps(
         int, Query(ge=1, le=MAX_SIDE, description=f"矩形高（格），<= {MAX_SIDE}")
     ],
 ) -> GapQueryResponse:
-    # A read-only connection sees one committed snapshot for the whole query.
-    conn = connect()
-    try:
+    # A read-only transaction sees one committed snapshot for the whole query.
+    with snapshot() as conn:
         result = query_gaps(conn, query_date, origin_x, origin_y, width, height)
-    finally:
-        conn.close()
     return GapQueryResponse(**result)  # type: ignore[arg-type]
+
+
+@app.get(
+    "/coverage/compare",
+    response_model=CoverageCompareResponse,
+    tags=["植被变化"],
+    summary="比较两个 UTC 日期区间的逐像元可算天数",
+    description=(
+        "输入网格矩形（宽高均 <= 256）与两段 UTC 日期区间（含首尾，可重叠、"
+        "可不等长）。逐格返回两期各有多少天可算：某天至少有一景同时在该格"
+        "提供有效红光和近红外，该格这一天计 1 天。并标出可算天数占日历天数"
+        "比例下降的像元（含逐行连续段）。\n\n"
+        "查询只读取已提交的跨期统计索引，不读取源掩膜或逐日覆盖；固定矩形的"
+        "读取量最多为矩形像元数，不随日期跨度或已入库天数增长。整个查询在同一"
+        "已提交快照中完成。"
+    ),
+)
+def coverage_compare(
+    origin_x: Annotated[int, Query(description="矩形左上角网格 x 坐标")],
+    origin_y: Annotated[int, Query(description="矩形左上角网格 y 坐标")],
+    width: Annotated[
+        int, Query(ge=1, le=MAX_SIDE, description=f"矩形宽（格），<= {MAX_SIDE}")
+    ],
+    height: Annotated[
+        int, Query(ge=1, le=MAX_SIDE, description=f"矩形高（格），<= {MAX_SIDE}")
+    ],
+    a_start: Annotated[
+        date_type, Query(alias="a_start", description="第一期起始 UTC 日期（含）")
+    ],
+    a_end: Annotated[
+        date_type, Query(alias="a_end", description="第一期结束 UTC 日期（含）")
+    ],
+    b_start: Annotated[
+        date_type, Query(alias="b_start", description="第二期起始 UTC 日期（含）")
+    ],
+    b_end: Annotated[
+        date_type, Query(alias="b_end", description="第二期结束 UTC 日期（含）")
+    ],
+) -> CoverageCompareResponse:
+    if a_start > a_end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="a_start must not be after a_end",
+        )
+    if b_start > b_end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="b_start must not be after b_end",
+        )
+    # One read-only transaction: both periods come from the same commit.
+    with snapshot() as conn:
+        result = compare_coverage(
+            conn,
+            origin_x,
+            origin_y,
+            width,
+            height,
+            a_start,
+            a_end,
+            b_start,
+            b_end,
+        )
+    return CoverageCompareResponse(**result)  # type: ignore[arg-type]
 
 
 @app.get(
@@ -107,11 +174,8 @@ def gaps(
     summary="回读某景的固定几何与已提交波段掩膜信息",
 )
 def read_scene(query_date: date_type, scene_id: str) -> SceneInfo:
-    conn = connect()
-    try:
+    with snapshot() as conn:
         result = get_scene(conn, query_date, scene_id)
-    finally:
-        conn.close()
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

@@ -73,6 +73,14 @@ class MaskSubmitResponse(BaseModel):
     coverage_cells_updated: int = Field(
         ..., description="Coverage rows rewritten within this scene's extent."
     )
+    cumulative_cells_updated: int = Field(
+        ...,
+        description=(
+            "Cells inside this scene's extent whose cross-period statistics "
+            "changed because this scene flipped them between computable and "
+            "not computable on this date."
+        ),
+    )
 
 
 # Gap categories returned to data operators.
@@ -140,3 +148,64 @@ class SceneInfo(BaseModel):
     width: int
     height: int
     bands: list[SceneBandInfo]
+
+
+class ComparePeriod(BaseModel):
+    start: date_type
+    end: date_type
+    calendar_days: int = Field(
+        ..., description="Inclusive calendar days from start through end."
+    )
+
+
+class DecreasedCell(BaseModel):
+    x: int
+    y: int
+    computable_days_a: int
+    computable_days_b: int
+    ratio_a: float = Field(
+        ..., description="Computable days / calendar days in period A."
+    )
+    ratio_b: float = Field(
+        ..., description="Computable days / calendar days in period B."
+    )
+
+
+class DecreasedRun(BaseModel):
+    """A run of consecutive decreased cells on one grid row."""
+
+    y: int
+    x_start: int
+    x_end: int
+    length: int
+
+
+class CoverageCompareResponse(BaseModel):
+    origin_x: int
+    origin_y: int
+    width: int
+    height: int
+    period_a: ComparePeriod
+    period_b: ComparePeriod
+    total_cells: int
+    computable_days_a: list[list[int]] = Field(
+        ...,
+        description=(
+            "Row-major (height x width) computable-day count in period A; "
+            "one row per grid row."
+        ),
+    )
+    computable_days_b: list[list[int]] = Field(
+        ..., description="Row-major (height x width) computable-day count in B."
+    )
+    decreased_count: int = Field(
+        ...,
+        description=(
+            "Cells whose computable-days / calendar-days ratio in B is lower "
+            "than in A."
+        ),
+    )
+    decreased_cells: list[DecreasedCell]
+    decreased_runs: list[DecreasedRun] = Field(
+        ..., description="Decreased cells merged into row-wise runs."
+    )
